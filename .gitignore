@@ -15,6 +15,7 @@ dist/
 # Local app data and logs
 *.log
 library.json
+logs/
 
 # Editors and OS files
 .vscode/

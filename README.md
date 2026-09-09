@@ -79,7 +79,7 @@ Built-in templates are included inside the executable. They cover common workflo
 
 Removing a built-in template hides it from the template list instead of deleting it from the executable. Use `Restore built-ins` to show hidden built-ins again.
 
-The app defaults to PowerShell. Change the active shell in the Settings tab; the Templates tab shows only templates that match that shell.
+The app defaults to PowerShell. Change the active shell in the Settings tab; the Templates tab shows only templates that match that shell. Settings also includes Light mode and Dark mode skins.
 
 ## Parameter placeholders
 
@@ -121,6 +121,8 @@ Bookmarks and templates are stored as JSON here:
 %APPDATA%\CommandLineGUI\library.json
 ```
 
+When `Save output logs` is enabled in Settings, completed run output is written to timestamped `.txt` files in the local `logs` folder. This is enabled by default.
+
 ## Run from source
 
 ```powershell
@@ -156,6 +158,8 @@ Then build:
 ```powershell
 .\build_exe.ps1
 ```
+
+The build uses the custom app icon in `assets\CommandLineGUI.ico`.
 
 The executable will be created in `dist\CommandLineGUI.exe`.
 

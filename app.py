@@ -6,11 +6,13 @@ import queue
 import re
 import shlex
 import subprocess
+import sys
 import tempfile
 import threading
 import uuid
 import tkinter as tk
 from dataclasses import dataclass
+from datetime import datetime
 from pathlib import Path
 from tkinter import filedialog, messagebox, ttk
 from typing import Iterable, Literal
@@ -18,6 +20,7 @@ from typing import Iterable, Literal
 
 ShellKind = Literal["powershell", "cmd"]
 PickerKind = Literal["file", "folder", "text"]
+ThemeKind = Literal["light", "dark"]
 
 
 ANGLE_PLACEHOLDER_RE = re.compile(r"<(?P<body>[A-Za-z][^>\r\n]*)>")
@@ -62,6 +65,59 @@ CMD_PATH_OPTIONS = {
     "/s",
     "/t",
     "/y",
+}
+
+THEMES: dict[ThemeKind, dict[str, str]] = {
+    "light": {
+        "bg": "#f5f7fb",
+        "panel": "#ffffff",
+        "panel_alt": "#eef2f7",
+        "header": "#ffffff",
+        "border": "#d6dce6",
+        "text": "#172033",
+        "muted": "#64748b",
+        "badge": "#e0f2fe",
+        "badge_text": "#075985",
+        "row_alt": "#f8fafc",
+        "status_bg": "#ecfdf5",
+        "status_text": "#166534",
+        "field": "#ffffff",
+        "field_text": "#111827",
+        "console_bg": "#012456",
+        "console_text": "#f8fafc",
+        "accent": "#2563eb",
+        "accent_hover": "#1d4ed8",
+        "run": "#15803d",
+        "run_hover": "#166534",
+        "danger": "#991b1b",
+        "drop": "#dbeafe",
+        "selection": "#2563eb",
+    },
+    "dark": {
+        "bg": "#1f232a",
+        "panel": "#2a2f38",
+        "panel_alt": "#343a46",
+        "header": "#262b34",
+        "border": "#444b57",
+        "text": "#e5e7eb",
+        "muted": "#aeb7c4",
+        "badge": "#1e3a5f",
+        "badge_text": "#bfdbfe",
+        "row_alt": "#1f2933",
+        "status_bg": "#173528",
+        "status_text": "#bbf7d0",
+        "field": "#171b22",
+        "field_text": "#f3f4f6",
+        "console_bg": "#101820",
+        "console_text": "#f8fafc",
+        "accent": "#60a5fa",
+        "accent_hover": "#3b82f6",
+        "run": "#22c55e",
+        "run_hover": "#16a34a",
+        "danger": "#f87171",
+        "drop": "#334155",
+        "selection": "#3b82f6",
+    },
 }
 
 POWERSHELL_VALUELESS_SWITCHES = {
@@ -517,12 +573,18 @@ def library_path() -> Path:
     return root / "CommandLineGUI" / "library.json"
 
 
+def logs_path() -> Path:
+    return Path(__file__).resolve().parent / "logs"
+
+
 class LibraryStore:
     def __init__(self, path: Path) -> None:
         self.path = path
         self.bookmarks: list[Bookmark] = []
         self.templates: list[ScriptTemplate] = []
         self.hidden_builtin_templates: set[str] = set()
+        self.theme: ThemeKind = "light"
+        self.save_output_logs = True
         self.load()
 
     def load(self) -> None:
@@ -535,6 +597,9 @@ class LibraryStore:
         self.hidden_builtin_templates = {
             str(template_id) for template_id in data.get("hidden_builtin_templates", []) if template_id
         }
+        raw_theme = data.get("theme") or data.get("settings", {}).get("theme")
+        self.theme = "dark" if raw_theme == "dark" else "light"
+        self.save_output_logs = bool(data.get("save_output_logs", data.get("settings", {}).get("save_output_logs", True)))
         self.bookmarks = [
             Bookmark(
                 id=str(item.get("id") or uuid.uuid4()),
@@ -584,8 +649,18 @@ class LibraryStore:
                 if not template.builtin
             ],
             "hidden_builtin_templates": sorted(self.hidden_builtin_templates),
+            "theme": self.theme,
+            "save_output_logs": self.save_output_logs,
         }
         self.path.write_text(json.dumps(data, indent=2), encoding="utf-8")
+
+    def set_theme(self, theme: ThemeKind) -> None:
+        self.theme = "dark" if theme == "dark" else "light"
+        self.save()
+
+    def set_save_output_logs(self, enabled: bool) -> None:
+        self.save_output_logs = bool(enabled)
+        self.save()
 
     def add_bookmark(self, bookmark: Bookmark) -> None:
         self.bookmarks.append(bookmark)
@@ -1124,6 +1199,8 @@ class CommandLineGui(tk.Tk):
 
         self.store = LibraryStore(library_path())
         self.shell_var = tk.StringVar(value="powershell")
+        self.theme_var = tk.StringVar(value=self.store.theme)
+        self.save_output_logs_var = tk.BooleanVar(value=self.store.save_output_logs)
         self.bookmark_group_var = tk.StringVar()
         self.bookmark_tag_var = tk.StringVar()
         self.template_group_var = tk.StringVar()
@@ -1132,6 +1209,7 @@ class CommandLineGui(tk.Tk):
         self.slot_rows: list[SlotRow] = []
         self.bookmark_ids: list[str] = []
         self.template_ids: list[str] = []
+        self.framed_text_widgets: list[tk.Text] = []
         self.drag_bookmark: Bookmark | None = None
         self.drag_started = False
         self.drag_start_xy: tuple[int, int] | None = None
@@ -1148,31 +1226,147 @@ class CommandLineGui(tk.Tk):
         self.bind("<Control-r>", lambda _event: self.detect_slots())
         self.bind("<Control-Return>", lambda _event: self.run_script())
 
-    def create_widgets(self) -> None:
-        style = ttk.Style(self)
-        style.configure("DropTarget.TFrame", background="#dbeafe")
-        self.console_font = ("Consolas", 10)
-        self.console_colors = {
-            "background": "#012456",
-            "foreground": "#f8fafc",
-            "insertbackground": "#f8fafc",
-            "selectbackground": "#2563eb",
+    @property
+    def theme(self) -> ThemeKind:
+        return "dark" if self.theme_var.get() == "dark" else "light"
+
+    def icon_path(self) -> Path:
+        base = Path(getattr(sys, "_MEIPASS", Path(__file__).parent))
+        return base / "assets" / "CommandLineGUI.ico"
+
+    def image_path(self) -> Path:
+        base = Path(getattr(sys, "_MEIPASS", Path(__file__).parent))
+        return base / "assets" / "CommandLineGUI.png"
+
+    def set_app_icon(self) -> None:
+        icon = self.icon_path()
+        if not icon.exists():
+            return
+        try:
+            self.iconbitmap(str(icon))
+        except tk.TclError:
+            pass
+
+    def text_widget_colors(self) -> dict[str, str]:
+        palette = THEMES[self.theme]
+        return {
+            "background": palette["console_bg"],
+            "foreground": palette["console_text"],
+            "insertbackground": palette["console_text"],
+            "selectbackground": palette["selection"],
             "selectforeground": "#ffffff",
         }
+
+    def configure_app_theme(self) -> None:
+        palette = THEMES[self.theme]
+        self.configure(background=palette["bg"])
+        self.option_add("*Font", "{Segoe UI} 9")
+        self.option_add("*TCombobox*Listbox.background", palette["field"])
+        self.option_add("*TCombobox*Listbox.foreground", palette["field_text"])
+        self.option_add("*TCombobox*Listbox.selectBackground", palette["selection"])
+        self.option_add("*TCombobox*Listbox.selectForeground", "#ffffff")
+
+        self.style.configure(".", background=palette["bg"], foreground=palette["text"], fieldbackground=palette["field"])
+        self.style.configure("TFrame", background=palette["bg"])
+        self.style.configure("Panel.TFrame", background=palette["panel"])
+        self.style.configure("Header.TFrame", background=palette["header"])
+        self.style.configure("Toolbar.TFrame", background=palette["panel"])
+        self.style.configure("TLabel", background=palette["bg"], foreground=palette["text"])
+        self.style.configure("Muted.TLabel", background=palette["bg"], foreground=palette["muted"])
+        self.style.configure("Title.TLabel", background=palette["header"], foreground=palette["text"], font="{Segoe UI} 13 bold")
+        self.style.configure("Subtitle.TLabel", background=palette["header"], foreground=palette["muted"], font="{Segoe UI} 9")
+        self.style.configure("Badge.TLabel", background=palette["badge"], foreground=palette["badge_text"], font="{Segoe UI} 9 bold", padding=(10, 4))
+        self.style.configure("Status.TLabel", background=palette["status_bg"], foreground=palette["status_text"], font="{Segoe UI} 9 bold", padding=(10, 4))
+        self.style.configure("TLabelframe", background=palette["bg"], foreground=palette["text"], bordercolor=palette["border"])
+        self.style.configure("TLabelframe.Label", background=palette["bg"], foreground=palette["text"], font="{Segoe UI} 9 bold")
+        self.style.configure("TButton", background=palette["panel_alt"], foreground=palette["text"], bordercolor=palette["border"], padding=(10, 5))
+        self.style.map("TButton", background=[("active", palette["panel"]), ("pressed", palette["border"])])
+        self.style.configure("TEntry", fieldbackground=palette["field"], foreground=palette["field_text"], bordercolor=palette["border"], insertcolor=palette["field_text"])
+        self.style.configure("TCombobox", fieldbackground=palette["field"], foreground=palette["field_text"], bordercolor=palette["border"], arrowcolor=palette["text"])
+        self.style.configure("TCheckbutton", background=palette["bg"], foreground=palette["text"])
+        self.style.configure("TRadiobutton", background=palette["bg"], foreground=palette["text"])
+        self.style.configure("TNotebook", background=palette["bg"], borderwidth=0)
+        self.style.configure("TNotebook.Tab", background=palette["panel_alt"], foreground=palette["text"], padding=(12, 6))
+        self.style.map("TNotebook.Tab", background=[("selected", palette["panel"])], foreground=[("selected", palette["text"])])
+        self.style.configure("Treeview", background=palette["field"], foreground=palette["field_text"], fieldbackground=palette["field"], bordercolor=palette["border"], rowheight=24)
+        self.style.configure("Treeview.Heading", background=palette["panel_alt"], foreground=palette["text"], relief="flat")
+        self.style.map("Treeview", background=[("selected", palette["selection"])], foreground=[("selected", "#ffffff")])
+        self.style.configure("Horizontal.TProgressbar", background=palette["run"], troughcolor=palette["panel_alt"], bordercolor=palette["border"], lightcolor=palette["run"], darkcolor=palette["run"])
+        self.style.configure("DropTarget.TFrame", background=palette["drop"])
+
+    def apply_theme_to_widgets(self) -> None:
+        palette = THEMES[self.theme]
+        self.console_colors = self.text_widget_colors()
+        for widget in (self.input_text, self.output_text, self.run_output):
+            widget.configure(**self.console_colors)
+        self.slot_canvas.configure(background=palette["panel"])
+        self.run_button.configure(
+            bg=palette["run"],
+            activebackground=palette["run_hover"],
+            fg="white",
+            activeforeground="white",
+        )
+        self.stop_button.configure(
+            bg=palette["panel_alt"],
+            activebackground=palette["panel"],
+            fg=palette["danger"],
+            activeforeground=palette["danger"],
+        )
+        self.update_shell_badge()
+        self.update_theme_badge()
+        self.configure_tree_tags()
+        for widget in getattr(self, "framed_text_widgets", []):
+            widget.configure(
+                highlightthickness=1,
+                highlightbackground=palette["border"],
+                highlightcolor=palette["accent"],
+                relief="flat",
+                padx=10,
+                pady=8,
+            )
+
+    def configure_tree_tags(self) -> None:
+        palette = THEMES[self.theme]
+        for tree_name in ("bookmarks_tree", "templates_tree"):
+            if not hasattr(self, tree_name):
+                continue
+            tree = getattr(self, tree_name)
+            tree.tag_configure("group", background=palette["panel_alt"], foreground=palette["text"], font="{Segoe UI} 9 bold")
+            tree.tag_configure("odd", background=palette["field"], foreground=palette["field_text"])
+            tree.tag_configure("even", background=palette["row_alt"], foreground=palette["field_text"])
+
+    def update_shell_badge(self) -> None:
+        if hasattr(self, "shell_badge_var"):
+            self.shell_badge_var.set(f"Shell: {self.shell_display_name()}")
+
+    def update_theme_badge(self) -> None:
+        if hasattr(self, "theme_badge_var"):
+            self.theme_badge_var.set(f"Skin: {self.theme.title()}")
+
+    def create_widgets(self) -> None:
+        self.set_app_icon()
+        self.style = ttk.Style(self)
+        if "clam" in self.style.theme_names():
+            self.style.theme_use("clam")
+        self.console_font = ("Consolas", 10)
+        self.console_colors = self.text_widget_colors()
+        self.configure_app_theme()
 
         root = ttk.Frame(self, padding=12)
         root.pack(fill="both", expand=True)
         root.columnconfigure(0, weight=1)
         root.columnconfigure(1, weight=0)
-        root.rowconfigure(0, weight=1)
+        root.rowconfigure(1, weight=1)
+
+        self.create_header(root)
 
         main = ttk.Frame(root)
-        main.grid(row=0, column=0, sticky="nsew", padx=(0, 12))
+        main.grid(row=1, column=0, sticky="nsew", padx=(0, 12))
         main.columnconfigure(0, weight=1)
         main.rowconfigure(1, weight=1)
         main.rowconfigure(3, weight=1)
 
-        toolbar = ttk.Frame(main)
+        toolbar = ttk.Frame(main, style="Toolbar.TFrame", padding=(8, 8))
         toolbar.grid(row=0, column=0, sticky="ew", pady=(0, 8))
         detect_button = ttk.Button(toolbar, text="Detect paths", command=self.detect_slots)
         detect_button.pack(side="left")
@@ -1192,13 +1386,14 @@ class CommandLineGui(tk.Tk):
         copy_active_button = ttk.Button(toolbar, text="Copy", command=self.copy_active_script_text)
         copy_active_button.pack(side="left", padx=(8, 0))
         add_tooltip(copy_active_button, "Copies selected text from the visible script tab, or all of it if nothing is selected.")
+        ttk.Separator(toolbar, orient="vertical").pack(side="left", fill="y", padx=(14, 2))
         self.run_button = tk.Button(
             toolbar,
             text="Run",
             command=self.run_script,
-            bg="#166534",
+            bg=THEMES[self.theme]["run"],
             fg="white",
-            activebackground="#15803d",
+            activebackground=THEMES[self.theme]["run_hover"],
             activeforeground="white",
             disabledforeground="#d1d5db",
             font=("Segoe UI", 10, "bold"),
@@ -1212,10 +1407,10 @@ class CommandLineGui(tk.Tk):
             toolbar,
             text="Stop",
             command=self.stop_script,
-            bg="#f3f4f6",
-            fg="#991b1b",
-            activebackground="#fee2e2",
-            activeforeground="#7f1d1d",
+            bg=THEMES[self.theme]["panel_alt"],
+            fg=THEMES[self.theme]["danger"],
+            activebackground=THEMES[self.theme]["panel"],
+            activeforeground=THEMES[self.theme]["danger"],
             disabledforeground="#9ca3af",
             font=("Segoe UI", 9, "bold"),
             padx=14,
@@ -1242,6 +1437,7 @@ class CommandLineGui(tk.Tk):
 
         self.input_text = tk.Text(input_frame, wrap="word", undo=True, font=self.console_font, **self.console_colors)
         self.input_text.grid(row=0, column=0, sticky="nsew")
+        self.framed_text_widgets.append(self.input_text)
         self.input_text.insert(
             "1.0",
             'Get-ChildItem -Path <source_folder:folder:Source> -Filter <filter:text:default=*.txt> -Recurse | Copy-Item -Destination <target_folder:folder:Target>\n',
@@ -1253,6 +1449,7 @@ class CommandLineGui(tk.Tk):
 
         self.output_text = tk.Text(output_frame, wrap="none", height=8, font=self.console_font, **self.console_colors)
         self.output_text.grid(row=0, column=0, sticky="nsew")
+        self.framed_text_widgets.append(self.output_text)
         output_xscroll = ttk.Scrollbar(output_frame, orient="horizontal", command=self.output_text.xview)
         output_xscroll.grid(row=1, column=0, sticky="ew")
         self.output_text.configure(xscrollcommand=output_xscroll.set)
@@ -1288,22 +1485,51 @@ class CommandLineGui(tk.Tk):
         ttk.Label(progress_row, textvariable=self.progress_label_var, width=18).grid(row=0, column=1, sticky="e", padx=(8, 0))
         self.run_output = tk.Text(run_body, wrap="none", height=8, font=self.console_font, **self.console_colors)
         self.run_output.grid(row=1, column=0, sticky="nsew")
+        self.framed_text_widgets.append(self.run_output)
         run_xscroll = ttk.Scrollbar(run_body, orient="horizontal", command=self.run_output.xview)
         run_xscroll.grid(row=2, column=0, sticky="ew")
         self.run_output.configure(xscrollcommand=run_xscroll.set)
         add_tooltip(self.progress_bar, "Shows activity while a script runs, then switches to a percentage when output contains progress values.")
         add_tooltip(self.run_output, "Live stdout and stderr from the running command, plus the exact script launched.")
 
-        self.status_var = tk.StringVar(value="Ready")
-        ttk.Label(main, textvariable=self.status_var).grid(row=4, column=0, sticky="ew", pady=(8, 0))
-
         self.create_library_sidebar(root)
 
+        self.apply_theme_to_widgets()
         self.detect_slots()
+
+    def create_header(self, root: ttk.Frame) -> None:
+        header = ttk.Frame(root, style="Header.TFrame", padding=(12, 10))
+        header.grid(row=0, column=0, columnspan=2, sticky="ew", pady=(0, 12))
+        header.columnconfigure(1, weight=1)
+
+        self.logo_image = None
+        image = self.image_path()
+        if image.exists():
+            try:
+                self.logo_image = tk.PhotoImage(file=str(image)).subsample(4, 4)
+                ttk.Label(header, image=self.logo_image, style="Title.TLabel").grid(row=0, column=0, rowspan=2, sticky="w", padx=(0, 10))
+            except tk.TclError:
+                pass
+
+        ttk.Label(header, text="Command Line GUI", style="Title.TLabel").grid(row=0, column=1, sticky="w")
+        ttk.Label(
+            header,
+            text="Turn scripts into reusable forms with Windows pickers, templates, and live output.",
+            style="Subtitle.TLabel",
+        ).grid(row=1, column=1, sticky="w")
+
+        self.shell_badge_var = tk.StringVar(value=f"Shell: {self.shell_display_name()}")
+        self.theme_badge_var = tk.StringVar(value=f"Skin: {self.theme.title()}")
+        ttk.Label(header, textvariable=self.shell_badge_var, style="Badge.TLabel").grid(row=0, column=2, sticky="e", padx=(12, 0))
+        ttk.Label(header, textvariable=self.theme_badge_var, style="Badge.TLabel").grid(row=0, column=3, sticky="e", padx=(8, 0))
+        self.status_var = tk.StringVar(value="Ready")
+        self.status_label = ttk.Label(header, textvariable=self.status_var, style="Status.TLabel")
+        self.status_label.grid(row=1, column=2, columnspan=2, sticky="e", padx=(12, 0), pady=(6, 0))
+        add_tooltip(self.status_label, "Shows the latest app action or run status.")
 
     def create_library_sidebar(self, root: ttk.Frame) -> None:
         sidebar = ttk.Frame(root, width=360)
-        sidebar.grid(row=0, column=1, sticky="nsew")
+        sidebar.grid(row=1, column=1, sticky="nsew")
         sidebar.columnconfigure(0, weight=1)
         sidebar.rowconfigure(0, weight=1)
 
@@ -1358,6 +1584,7 @@ class CommandLineGui(tk.Tk):
                 continue
             grouped.setdefault(display_group(bookmark.group), []).append(bookmark)
 
+        row_index = 0
         for group_name in sorted(grouped, key=group_sort_key):
             bookmarks = sorted(grouped[group_name], key=lambda item: item.name.lower())
             group_id = f"bookmark-group:{group_name}"
@@ -1371,16 +1598,19 @@ class CommandLineGui(tk.Tk):
                 tags=("group",),
             )
             for bookmark in bookmarks:
+                row_tag = "even" if row_index % 2 == 0 else "odd"
                 item_id = self.bookmarks_tree.insert(
                     group_item,
                     "end",
                     iid=f"bookmark:{bookmark.id}",
                     text=bookmark.name,
                     values=(bookmark.tags, bookmark.picker_kind, bookmark.path),
-                    tags=("bookmark", bookmark.id),
+                    tags=("bookmark", bookmark.id, row_tag),
                 )
+                row_index += 1
                 self.bookmark_ids.append(bookmark.id)
                 self.bookmarks_tree.set(item_id, "path", bookmark.path)
+        self.configure_tree_tags()
 
     def refresh_templates(self) -> None:
         if not hasattr(self, "templates_tree"):
@@ -1399,6 +1629,7 @@ class CommandLineGui(tk.Tk):
                 continue
             grouped.setdefault(display_group(template.group), []).append(template)
 
+        row_index = 0
         for group_name in sorted(grouped, key=group_sort_key):
             templates = sorted(grouped[group_name], key=lambda item: item.name.lower())
             group_id = f"template-group:{group_name}"
@@ -1412,15 +1643,18 @@ class CommandLineGui(tk.Tk):
                 tags=("group",),
             )
             for template in templates:
+                row_tag = "even" if row_index % 2 == 0 else "odd"
                 item_id = self.templates_tree.insert(
                     group_item,
                     "end",
                     iid=f"template:{template.id}",
                     text=template.name,
                     values=(template.tags,),
-                    tags=("template", template.id),
+                    tags=("template", template.id, row_tag),
                 )
+                row_index += 1
                 self.template_ids.append(template.id)
+        self.configure_tree_tags()
 
     def selected_bookmark(self) -> Bookmark | None:
         selection = self.bookmarks_tree.selection()
@@ -1831,9 +2065,66 @@ class CommandLineGui(tk.Tk):
         add_tooltip(cmd_radio, "Use CMD/batch syntax for path quoting, templates, and script execution.")
         add_tooltip(description, "Changing the shell refreshes detected parameters and hides templates for the other shell.")
 
+        theme_box = ttk.Labelframe(parent, text="Appearance")
+        theme_box.grid(row=1, column=0, sticky="ew", pady=(12, 0))
+        theme_box.columnconfigure(0, weight=1)
+        theme_description = ttk.Label(
+            theme_box,
+            text="Choose a light skin or a dark gray skin for the app chrome.",
+            wraplength=320,
+        )
+        theme_description.grid(row=0, column=0, sticky="ew", padx=8, pady=(8, 6))
+        light_radio = ttk.Radiobutton(
+            theme_box,
+            text="Light mode",
+            variable=self.theme_var,
+            value="light",
+            command=self.theme_changed,
+        )
+        light_radio.grid(row=1, column=0, sticky="w", padx=8, pady=4)
+        dark_radio = ttk.Radiobutton(
+            theme_box,
+            text="Dark mode",
+            variable=self.theme_var,
+            value="dark",
+            command=self.theme_changed,
+        )
+        dark_radio.grid(row=2, column=0, sticky="w", padx=8, pady=(4, 8))
+        add_tooltip(light_radio, "Use the original light app skin.")
+        add_tooltip(dark_radio, "Use the darker gray app skin.")
+        add_tooltip(theme_description, "The selected skin is saved and restored next time the app opens.")
+
+        output_box = ttk.Labelframe(parent, text="Output")
+        output_box.grid(row=2, column=0, sticky="ew", pady=(12, 0))
+        output_box.columnconfigure(0, weight=1)
+        save_logs_checkbox = ttk.Checkbutton(
+            output_box,
+            text="Save output logs",
+            variable=self.save_output_logs_var,
+            command=self.save_output_logs_changed,
+        )
+        save_logs_checkbox.grid(row=0, column=0, sticky="w", padx=8, pady=(8, 4))
+        log_location = ttk.Label(output_box, text=f"Logs folder: {logs_path()}", wraplength=320)
+        log_location.grid(row=1, column=0, sticky="ew", padx=8, pady=(0, 8))
+        add_tooltip(save_logs_checkbox, "Save every completed run output to a timestamped text file.")
+        add_tooltip(log_location, "Run logs are stored next to the app source in the local logs folder.")
+
     def shell_changed(self) -> None:
         self.detect_slots()
         self.refresh_templates()
+        self.update_shell_badge()
+
+    def theme_changed(self) -> None:
+        self.store.set_theme(self.theme)
+        self.configure_app_theme()
+        self.apply_theme_to_widgets()
+        self.status_var.set(f"Switched to {self.theme} mode.")
+
+    def save_output_logs_changed(self) -> None:
+        enabled = bool(self.save_output_logs_var.get())
+        self.store.set_save_output_logs(enabled)
+        state = "enabled" if enabled else "disabled"
+        self.status_var.set(f"Output log saving {state}.")
 
     def resize_slots(self, _event=None) -> None:
         self.slot_canvas.configure(scrollregion=self.slot_canvas.bbox("all"))
@@ -1992,7 +2283,7 @@ class CommandLineGui(tk.Tk):
         self.run_output.insert("end", "-" * 72 + "\n")
         self.run_output.insert("end", "Running...\n")
         self.status_var.set("Running script...")
-        self.run_button.configure(state="disabled", bg="#14532d")
+        self.run_button.configure(state="disabled", bg=THEMES[self.theme]["run_hover"])
         self.stop_button.configure(state="normal")
         self.start_progress()
         self.update_idletasks()
@@ -2086,9 +2377,29 @@ class CommandLineGui(tk.Tk):
         if note:
             self.run_output.insert("end", f"\n{note}")
         self.run_output.see("end")
+        log_file = self.save_run_log(return_code)
         self.running_process = None
         self.cleanup_script_file()
-        self.finish_process_ui(f"Finished with exit code {return_code}.")
+        status = f"Finished with exit code {return_code}."
+        if log_file:
+            status += f" Log saved: {log_file.name}"
+        self.finish_process_ui(status)
+
+    def save_run_log(self, return_code: int) -> Path | None:
+        if not self.save_output_logs_var.get():
+            return None
+        try:
+            folder = logs_path()
+            folder.mkdir(parents=True, exist_ok=True)
+            timestamp = datetime.now().strftime("%Y%m%d-%H%M%S")
+            filename = f"{timestamp}-{self.shell}-exit{return_code}.txt"
+            path = folder / filename
+            path.write_text(self.run_output.get("1.0", "end-1c"), encoding="utf-8")
+            return path
+        except OSError as exc:
+            self.run_output.insert("end", f"\nCould not save output log: {exc}")
+            self.run_output.see("end")
+            return None
 
     def exit_code_note(self, return_code: int) -> str:
         script = self.current_script.strip().lower()
@@ -2157,7 +2468,7 @@ class CommandLineGui(tk.Tk):
 
     def finish_process_ui(self, status: str) -> None:
         self.stop_progress()
-        self.run_button.configure(state="normal", bg="#166534")
+        self.run_button.configure(state="normal", bg=THEMES[self.theme]["run"])
         self.stop_button.configure(state="disabled")
         self.status_var.set(status)
 
